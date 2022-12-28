@@ -10,22 +10,32 @@ Simply mount a directory with a CGI handler.
 rocket().mount("/cgi", CGIDir::new("./cgi"))
 ```
 
+## Configuration
+
+- `cgi` data limit for post requests (1 MiB default)
+
 ## Notes
 
 This CGI handler will automatically attempt to kill the script when stdout has
 been closed. More most usecases this is fine, since the script will close stdout
 by exiting.
 
+This also don't implement several optional parts of the spec. For example,
+extension methods (even just PUT & DELETE) are not supported.
+
 ## TODO
 
 - [ ] Security
   - [ ] Check file permissions - Deny writable files?
   - [ ] Check file permissions - Deny setuid bit
-  - [ ] Block path traversal
+  - [x] Block path traversal
   - [ ] Ignore dot files / hidden files
 - [ ] Configuration
-  - [ ] CGI data limitation
+  - [x] CGI data limitation
   - [ ] Limit file types (i.e. a CGIDir can only execute python, etc)
   - [ ] Custom file types
 - [ ] Functionality
   - [ ] Additional default filetypes
+  - [ ] Allocate less
+  - [ ] Redirection
+  - [ ] Extension headers

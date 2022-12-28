@@ -13,7 +13,7 @@ use std::{
 
 use rocket::{
     data::ToByteUnit,
-    http::{uncased, ContentType, Header, Method},
+    http::{uncased, ContentType, Method},
     request::Request,
     route::Outcome,
 };
@@ -24,25 +24,16 @@ use tokio::{
     process::{Child, Command},
 };
 
-// impl FileType {
-//     fn arg(&self) -> Option<&'static str> {
-//         match self {
-//             FileType::Bash => Some("bash"),
-//             FileType::Python => Some("python"),
-//             FileType::Python2 => todo!(),
-//             FileType::Python3 => todo!(),
-//             FileType::Perl => Some("perl"),
-//             FileType::Executable => None,
-//         }
-//     }
-// }
-
-/// Executes CGIScript to generate response
+/// Custom handler to execute CGIScripts
+///
+/// This handler will execute any script within the directory
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CGIDir {
     path: Cow<'static, Path>,
     allow_unencoded_equals: bool,
 }
+
+const PATH_DEF: &str = "/<path..>?<..>";
 
 impl CGIDir {
     /// Generate a CGI script from the associated path
@@ -53,17 +44,31 @@ impl CGIDir {
         }
     }
 
-    async fn locate_file<'r>(&self, r: &'r Request<'_>) -> io::Result<(PathBuf, &'r str)> {
+    async fn locate_file<'r>(&self, r: &'r Request<'_>) -> io::Result<(PathBuf, String)> {
         let mut path = self.path.to_path_buf();
-        let prefix = r
-            .route()
-            .unwrap()
-            .uri
-            .as_str()
-            .trim_end_matches("<..>?<..>");
-        let trailing = r.uri().path().as_str().trim_start_matches(prefix);
-        path.push(trailing);
-        // dbg!(&path);
+        let prefix = r.route().unwrap().uri.as_str().trim_end_matches(PATH_DEF);
+        let uri_path = r.uri().path();
+        let decoded = uri_path
+            .strip_prefix(prefix)
+            .unwrap_or(&uri_path) // This shouldn't happen, since the URL matched
+            .percent_decode()
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "URL is not valid UTF-8"))?;
+        let trailing = decoded.trim_start_matches(|c| c == '/' || c == '\\');
+        // Final trim allows repeated `/`s in the file while
+        let trailing_path = Path::new(trailing);
+        if !trailing_path.is_relative() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Absolute paths not allowed",
+            ));
+        }
+        path.push(trailing_path);
+        // Sadly this allocates, but I don't think there's a way arount it
+        let mut path = tokio::fs::canonicalize(path).await?;
+        if !path.starts_with(&self.path) {
+            return Err(Error::new(ErrorKind::Other, "Outside directory"));
+        }
+
         let meta = tokio::fs::metadata(&path).await?;
         if meta.is_dir() {
             path.push("index.pl"); // ?
@@ -72,7 +77,8 @@ impl CGIDir {
                 "Directories not supported",
             ));
         }
-        Ok((path, trailing))
+        // This sadly has to return a String, should be refactored to avoid.
+        Ok((path, trailing.to_string()))
     }
 
     fn command(program: &str, path: PathBuf) -> Command {
@@ -231,17 +237,23 @@ impl Handler for CGIDir {
             Ok(file) => file,
             Err(_e) => return Outcome::Forward(data),
         };
-        let mut process = match self.build_process(file, name, request) {
+        let mut process = match self.build_process(file, &name, request) {
             Ok(p) => p,
             Err(e) if e.kind() == ErrorKind::NotFound => return Outcome::Forward(data),
             Err(_) => return Outcome::Failure(Status::InternalServerError),
         };
         let mut body = process.stdin.take().unwrap();
+
+        let limit = request
+            .rocket()
+            .config()
+            .limits
+            .find(["cgi"])
+            .unwrap_or(1.mebibytes());
+
         // Not ideal to box this, but we need to move it later, so...
         let mut write_post_data =
-            Box::pin(
-                async move { tokio::io::copy(&mut data.open(100.mebibytes()), &mut body).await },
-            );
+            Box::pin(async move { tokio::io::copy(&mut data.open(limit), &mut body).await });
         let generate_response = Self::generate_response(process);
         tokio::pin!(generate_response);
         tokio::select! {
@@ -260,6 +272,10 @@ impl Handler for CGIDir {
 
 impl Into<Vec<Route>> for CGIDir {
     fn into(self) -> Vec<Route> {
-        vec![Route::new(Method::Get, "/<..>?<..>", self.clone())]
+        vec![
+            Route::ranked(9, Method::Get, PATH_DEF, self.clone()),
+            Route::ranked(9, Method::Post, PATH_DEF, self.clone()),
+            Route::ranked(9, Method::Head, PATH_DEF, self.clone()),
+        ]
     }
 }
