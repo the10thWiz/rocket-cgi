@@ -1,6 +1,7 @@
 # Simple CGI (RFC 3875) handler for Rocket
 
-Simple standards compliant CGI handler for Rocket
+Simple standards compliant CGI handler for Rocket. This is still a WIP, and will
+remain so until the security todo items have been handled.
 
 ## Usage
 
