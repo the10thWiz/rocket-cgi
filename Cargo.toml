@@ -12,4 +12,4 @@ categories = ["rocket", "web-programming"]
 
 [dependencies]
 rocket = { version = "0.5.0-rc.2", default-features = false }
-tokio = { version = "*", default-features = false, features = ["process", "io-util"] }
+tokio = { version = "1.6.1", default-features = false, features = ["process", "io-util"] }
