@@ -17,26 +17,26 @@ rocket().mount("/cgi", CGIDir::new("./cgi"))
 
 ## Notes
 
-This CGI handler will automatically attempt to kill the script when stdout has
-been closed. More most usecases this is fine, since the script will close stdout
-by exiting.
+This CGI handler will automatically attempt to kill the script as soon as
+possible. If the process closes stdout, the header lines have been printed for a
+HEAD request, or a redirect was sent will all cause the process to be killed.
 
 This also don't implement several optional parts of the spec. For example,
 extension methods (even just PUT & DELETE) are not supported.
 
 ## TODO
 
-- [ ] Security
+- [x] Security
   - [ ] Check file permissions - Deny writable files?
-  - [ ] Check file permissions - Deny setuid bit
+  - [x] Check file permissions - Deny setuid bit
   - [x] Block path traversal
-  - [ ] Ignore dot files / hidden files
-- [ ] Configuration
+  - [x] Ignore dot files / hidden files
+- [x] Configuration
   - [x] CGI data limitation
-  - [ ] Limit file types (i.e. a CGIDir can only execute python, etc)
-  - [ ] Custom file types
+  - [x] Limit file types (i.e. a CGIDir can only execute python, etc)
+  - [x] Custom file types
 - [ ] Functionality
-  - [ ] Additional default filetypes
+  - [x] Additional default filetypes
   - [ ] Allocate less
-  - [ ] Redirection
+  - [x] Redirection
   - [ ] Extension headers
