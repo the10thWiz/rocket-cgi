@@ -195,7 +195,11 @@ impl CGIDir {
             Ok(_) => return self.set_file_type("py", Path::new("python3")),
             _ => (),
         }
-        match Command::new("python").arg("-V").spawn() {
+        match Command::new("python")
+            .arg("-V")
+            .stdout(Stdio::piped())
+            .spawn()
+        {
             Ok(c) => {
                 let mut s = String::new();
                 let _ = c.stdout.unwrap().read_to_string(&mut s);
@@ -211,7 +215,7 @@ impl CGIDir {
     /// Automatically detect python executables. This should allow either `python` or `python2` to
     /// be present on the system
     ///
-    /// ```rust
+    /// ```rust,no_run
     /// # use rocket::{build, http::Status};
     /// # use rocket::local::blocking::Client;
     /// # use rocket_cgi::CGIDir;
@@ -232,7 +236,11 @@ impl CGIDir {
             Ok(_) => return self.set_file_type("py", Path::new("python3")),
             _ => (),
         }
-        match Command::new("python").arg("-V").spawn() {
+        match Command::new("python")
+            .arg("-V")
+            .stdout(Stdio::piped())
+            .spawn()
+        {
             Ok(c) => {
                 let mut s = String::new();
                 let _ = c.stdout.unwrap().read_to_string(&mut s);
