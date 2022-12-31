@@ -26,17 +26,14 @@ extension methods (even just PUT & DELETE) are not supported.
 
 ## TODO
 
-- [x] Security
+- Security
   - [ ] Check file permissions - Deny writable files?
   - [x] Check file permissions - Deny setuid bit
   - [x] Block path traversal
   - [x] Ignore dot files / hidden files
-- [x] Configuration
-  - [x] CGI data limitation
-  - [x] Limit file types (i.e. a CGIDir can only execute python, etc)
-  - [x] Custom file types
-- [ ] Functionality
+- Functionality
   - [x] Additional default filetypes
-  - [ ] Allocate less
   - [x] Redirection
   - [ ] Extension headers
+- Testing
+  - [ ] Test Windows-only features (Hidden Files & System/Temporary Files)

@@ -23,8 +23,11 @@ pub fn has_dot_file(c: impl AsRef<Path>) -> bool {
 }
 
 /// Windows constants
+#[allow(unused)]
 const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x100;
+#[allow(unused)]
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+#[allow(unused)]
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 
 #[cfg(windows)]
@@ -39,7 +42,9 @@ pub fn has_hidden_file(m: &Metadata) -> bool {
 }
 
 /// Linux constants
+#[allow(unused)]
 const SETUID: u32 = 0o4000;
+#[allow(unused)]
 const SETGID: u32 = 0o2000;
 
 #[cfg(unix)]
@@ -71,4 +76,49 @@ pub fn allowed(c: &Metadata) -> bool {
 
 pub fn is_writable(c: &Metadata) -> bool {
     !c.permissions().readonly()
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use std::{fs::metadata, process::Command};
+
+    use super::*;
+    pub type Res = std::io::Result<()>;
+
+    pub fn cmd(s: &str) -> Res {
+        let mut parts = s.split_whitespace();
+        let mut cmd = Command::new(parts.next().unwrap());
+        cmd.args(parts);
+        assert!(cmd.spawn()?.wait()?.success());
+        Ok(())
+    }
+
+    #[test]
+    fn check_setuid() -> Res {
+        cmd("touch /tmp/file_perms")?;
+        assert_eq!(has_setuid(&metadata("/tmp/file_perms")?), false);
+        cmd("chmod u+s /tmp/file_perms")?;
+        assert_eq!(has_setuid(&metadata("/tmp/file_perms")?), true);
+        cmd("chmod g+s /tmp/file_perms")?;
+        assert_eq!(has_setuid(&metadata("/tmp/file_perms")?), true);
+        cmd("chmod u-s /tmp/file_perms")?;
+        assert_eq!(has_setuid(&metadata("/tmp/file_perms")?), true);
+        cmd("chmod g-s /tmp/file_perms")?;
+        assert_eq!(has_setuid(&metadata("/tmp/file_perms")?), false);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_for_dotfile() {
+        assert_eq!(has_dot_file(".file/something"), true);
+        assert_eq!(has_dot_file("file/.something"), true);
+        assert_eq!(has_dot_file("file/something."), false);
+        assert_eq!(has_dot_file("file/something"), false);
+        assert_eq!(has_dot_file("file/something.txt"), false);
+    }
 }

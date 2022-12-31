@@ -7,7 +7,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     future::{ready, Future},
-    io::{self, Error, ErrorKind},
+    io::{self, Error, ErrorKind, Read},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -19,7 +19,7 @@ use os::{allowed, has_dot_file, has_setuid, is_writable};
 use rocket::{
     data::ToByteUnit,
     http::{uncased, ContentType, Method},
-    log::error_,
+    log::*,
     request::Request,
     response::{Redirect, Responder},
     route::Outcome,
@@ -27,7 +27,7 @@ use rocket::{
 use rocket::{http::Status, Data};
 use rocket::{response::Response, route::Handler, Route};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
 };
 
@@ -43,21 +43,32 @@ bitfield! {
     setuid, set_setuid: 3;
     direct_executable, set_direct_executable: 4;
     writable_files, set_writable_files: 5;
+    allow_post, set_allow_post: 6;
+    allow_get, set_allow_get: 7;
+    ensure_newline, set_ensure_newline: 8;
 }
 
 /// Custom handler to execute CGIScripts
 ///
-/// This handler will execute any script within the directory
+/// This handler will execute any script within the directory provided.
+/// See examples/cgi.rs for a full usage example
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CGIDir {
-    path: Cow<'static, Path>,
+    path: PathBuf,
     settings: CGISettings,
     file_types: HashMap<Cow<'static, str>, Cow<'static, Path>>,
 }
 
 impl CGIDir {
     /// Generate a CGI script from the associated path
-    pub fn new(path: impl Into<PathBuf>) -> Self {
+    ///
+    /// ```rust
+    /// # use rocket::build;
+    /// # use rocket_cgi::CGIDir;
+    /// build().mount("/", CGIDir::new("examples"))
+    /// # ;
+    /// ```
+    pub fn new(path: impl AsRef<Path>) -> Self {
         let mut settings = CGISettings(0);
         settings.set_unencoded_equals(false);
         settings.set_dot_files(false);
@@ -65,8 +76,11 @@ impl CGIDir {
         settings.set_setuid(false);
         settings.set_direct_executable(true);
         settings.set_writable_files(true);
+        settings.set_allow_get(true);
+        settings.set_allow_post(true);
+        settings.set_ensure_newline(false);
         Self {
-            path: Cow::Owned(path.into()),
+            path: std::fs::canonicalize(path).expect("Path does not exist"),
             settings,
             file_types: [("pl", "perl"), ("py", "python"), ("sh", "sh")]
                 .iter()
@@ -76,14 +90,41 @@ impl CGIDir {
     }
 
     /// Clear file type associations, and disables directly running executables
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").clear_file_types());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::InternalServerError);
+    /// // Since the file could not be executed, a 500 error is returned
+    /// ```
     pub fn clear_file_types(mut self) -> Self {
         self.file_types.clear();
         self.settings.set_direct_executable(false);
         self
     }
 
-    /// Add a file type association for executing a file
-    pub fn add_file_type(
+    /// Add a file type association for executing a file. Overrides an existing file type
+    /// association if one exists.
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// # use std::path::Path;
+    /// let rocket = build().mount("/",
+    ///     CGIDir::new("test")
+    ///         .clear_file_types()// Clear file types
+    ///         .set_file_type("sh", Path::new("sh"))// manually insert `sh`
+    ///     );
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// ```
+    pub fn set_file_type(
         mut self,
         extension: impl Into<Cow<'static, str>>,
         executable: impl Into<Cow<'static, Path>>,
@@ -92,27 +133,152 @@ impl CGIDir {
         self
     }
 
-    /// Only allow executing perl scripts
+    /// Only allow executing perl scripts. Disables all filetypes except `.pl`
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").only_perl());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.pl").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// let res = client.get("/simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::InternalServerError);
+    /// ```
     pub fn only_perl(mut self) -> Self {
         self.file_types.retain(|s, _| s == "pl");
+        self.settings.set_direct_executable(false);
         self
     }
 
-    /// Only allow executing python scripts
+    /// Only allow executing python scripts. Disables all filetypes except `.py`
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").only_python().detect_python3());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.py").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// let res = client.get("/simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::InternalServerError);
+    /// ```
     pub fn only_python(mut self) -> Self {
         self.file_types.retain(|s, _| s == "py");
+        self.settings.set_direct_executable(false);
         self
     }
 
-    /// Only allow executing python scripts
+    /// Automatically detect python executables. This should allow either `python` or `python3` to
+    /// be present on the system
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").detect_python3());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.py").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If python cannot be found on the current Path. If a version of python not on the path is
+    /// desired, it is recommended to explicitly set the path e.g.
+    /// `.set_file_type("py", Path::new("/opt/py/bin/python"))`
+    pub fn detect_python3(self) -> Self {
+        use std::process::Command;
+        match Command::new("python3").arg("-V").spawn() {
+            Ok(_) => return self.set_file_type("py", Path::new("python3")),
+            _ => (),
+        }
+        match Command::new("python").arg("-V").spawn() {
+            Ok(c) => {
+                let mut s = String::new();
+                let _ = c.stdout.unwrap().read_to_string(&mut s);
+                if s.starts_with("Python 3") {
+                    return self.set_file_type("py", Path::new("python"));
+                }
+            }
+            _ => (),
+        }
+        panic!("Python 3 not found")
+    }
+
+    /// Automatically detect python executables. This should allow either `python` or `python2` to
+    /// be present on the system
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").detect_python2());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.py").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If python cannot be found on the current Path. If a version of python not on the path is
+    /// desired, it is recommended to explicitly set the path e.g.
+    /// `.set_file_type("py", Path::new("/opt/py/bin/python"))`
+    pub fn detect_python2(self) -> Self {
+        use std::process::Command;
+        match Command::new("python2").arg("-V").spawn() {
+            Ok(_) => return self.set_file_type("py", Path::new("python3")),
+            _ => (),
+        }
+        match Command::new("python").arg("-V").spawn() {
+            Ok(c) => {
+                let mut s = String::new();
+                let _ = c.stdout.unwrap().read_to_string(&mut s);
+                if s.starts_with("Python 2") {
+                    return self.set_file_type("py", Path::new("python"));
+                }
+            }
+            _ => (),
+        }
+        panic!("Python 2 not found")
+    }
+
+    /// Only allow executing python scripts. Disables all filetypes except `.sh`
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").only_sh());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// let res = client.get("/simple.py").dispatch();
+    /// assert_eq!(res.status(), Status::InternalServerError);
+    /// ```
     pub fn only_sh(mut self) -> Self {
         self.file_types.retain(|s, _| s == "sh");
+        self.settings.set_direct_executable(false);
         self
     }
 
-    /// Sets the shell interpreter
+    /// Sets the shell interpreter. Implicitly enables `.sh` files if they are currently disabled
     ///
     /// Default is `sh`
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// # use std::path::Path;
+    /// let rocket = build().mount("/", CGIDir::new("test").shell_interpreter(Path::new("bash")));
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/shell.sh").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// assert_eq!(res.into_string().unwrap(), "bash\n");
+    /// ```
     pub fn shell_interpreter(mut self, executable: impl Into<Cow<'static, Path>>) -> Self {
         self.file_types.insert("sh".into(), executable.into());
         self
@@ -122,6 +288,22 @@ impl CGIDir {
     /// - cmd.exe: .cmd, .bat
     /// - powershell.exe: .ps1
     /// - cscript.exe: .wsf, .vbs, .js
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// # use std::path::Path;
+    /// # #[cfg(windows)]
+    /// # fn main() {
+    /// let rocket = build().mount("/", CGIDir::new("test").add_windows_scripts());
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/simple.cmd").dispatch();
+    /// assert_eq!(res.status(), Status::Ok);
+    /// # }
+    /// # // Empty main to allow testing on non-windows platforms
+    /// # #[cfg(not(windows))] fn main() {}
+    /// ```
     pub fn add_windows_scripts(mut self) -> Self {
         [
             ("cmd", "cmd.exe"),
@@ -141,7 +323,7 @@ impl CGIDir {
     /// Whether to allow directly executable files. This may allow scripts with execute
     /// permissions and a shebang (`#!`) to be executed, on some systems.
     ///
-    /// The CGI spec requires this to be false, which is the default
+    /// Defaults to true
     pub fn direct_executables(mut self, allow: bool) -> Self {
         self.settings.set_direct_executable(allow);
         self
@@ -158,6 +340,16 @@ impl CGIDir {
     /// Whether to allow serving unix hidden files (files starting with a `.`)
     ///
     /// Defaults to false
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").dot_files(false));
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/.simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::NotFound);
+    /// ```
     pub fn dot_files(mut self, allow: bool) -> Self {
         self.settings.set_dot_files(allow);
         self
@@ -192,6 +384,42 @@ impl CGIDir {
         self
     }
 
+    /// Whether to serve GET & HEAD requests
+    ///
+    /// Defaults to true
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").serve_get(false));
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.get("/.simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::NotFound);
+    /// ```
+    pub fn serve_get(mut self, allow: bool) -> Self {
+        self.settings.set_allow_get(allow);
+        self
+    }
+
+    /// Whether to serve POST requests
+    ///
+    /// Defaults to true
+    ///
+    /// ```rust
+    /// # use rocket::{build, http::Status};
+    /// # use rocket::local::blocking::Client;
+    /// # use rocket_cgi::CGIDir;
+    /// let rocket = build().mount("/", CGIDir::new("test").serve_post(false));
+    /// let client = Client::tracked(rocket).unwrap();
+    /// let res = client.post("/.simple.sh").dispatch();
+    /// assert_eq!(res.status(), Status::NotFound);
+    /// ```
+    pub fn serve_post(mut self, allow: bool) -> Self {
+        self.settings.set_allow_post(allow);
+        self
+    }
+
     async fn locate_file<'r>(&self, r: &'r Request<'_>) -> io::Result<Child> {
         let mut path = self.path.to_path_buf();
         let prefix = r.route().unwrap().uri.as_str().trim_end_matches(PATH_DEF);
@@ -207,7 +435,7 @@ impl CGIDir {
 
         if !self.settings.dot_files() && has_dot_file(trailing_path) {
             return Err(io::Error::new(
-                ErrorKind::Other,
+                ErrorKind::NotFound,
                 "Hidden files not permitted",
             ));
         }
@@ -222,16 +450,19 @@ impl CGIDir {
         // Sadly this allocates, but I don't think there's a way arount it
         let path = tokio::fs::canonicalize(path).await?;
         if !path.starts_with(&self.path) {
+            // error_!("Path: {}", path.display());
             return Err(Error::new(
-                ErrorKind::Other,
+                ErrorKind::NotFound,
                 "Files outside directory not permitted",
             ));
         }
 
+        debug_!("Path: {}", path.display());
         let meta = tokio::fs::metadata(&path).await?;
-        if !self.settings.setuid() && !has_setuid(&meta) {
+        debug_!("meta: {:?}", meta);
+        if !self.settings.setuid() && has_setuid(&meta) {
             return Err(io::Error::new(
-                ErrorKind::Other,
+                ErrorKind::NotFound,
                 "Setuid files not permitted",
             ));
         }
@@ -275,6 +506,7 @@ impl CGIDir {
                 "Direct executables not permitted",
             ));
         };
+        builder.env_clear();
 
         if let Some(query) = r.uri().query() {
             builder.env("QUERY_STRING", query.as_str());
@@ -288,7 +520,7 @@ impl CGIDir {
         }
         builder.env("AUTH_TYPE", "");
         // We allow this to be empty (e.g. Transfer-Encoding: chunked), and don't set it if we
-        // don't know.
+        // don't know. The Spec technically requires it to be set, but we ignore that
         if let Some(len) = r.headers().get_one("Content-Length") {
             builder.env("CONTENT_LENGTH", len);
         }
@@ -318,6 +550,7 @@ impl CGIDir {
         builder.stdout(Stdio::piped());
         builder.kill_on_drop(true);
 
+        info_!("Command: {:?}", builder);
         builder.spawn()
     }
 
@@ -447,7 +680,10 @@ impl Handler for CGIDir {
         let mut process = match self.locate_file(request).await {
             Ok(p) => p,
             Err(e) if e.kind() == ErrorKind::NotFound => return Outcome::Forward(data),
-            Err(_) => return Outcome::Failure(Status::InternalServerError),
+            Err(e) => {
+                error_!("Error: {e}");
+                return Outcome::Failure(Status::InternalServerError);
+            }
         };
         let mut body = process.stdin.take().unwrap();
 
@@ -474,8 +710,13 @@ impl Handler for CGIDir {
                 res
             })
         } else if request.method() == Method::Post {
-            let mut write_post_data =
-                Box::pin(async move { tokio::io::copy(&mut data.open(limit), &mut body).await });
+            let ensure_newline = self.settings.ensure_newline();
+            let mut write_post_data = Box::pin(async move {
+                let _ = tokio::io::copy(&mut data.open(limit), &mut body).await;
+                if ensure_newline {
+                    let _ = body.write_all(b"\n").await;
+                }
+            });
             tokio::pin!(generate_response);
             tokio::select! {
                 biased;// Ideally we want to take the first path, so we should always try the first one
@@ -496,10 +737,106 @@ impl Handler for CGIDir {
 
 impl Into<Vec<Route>> for CGIDir {
     fn into(self) -> Vec<Route> {
-        vec![
-            Route::ranked(9, Method::Get, PATH_DEF, self.clone()),
-            Route::ranked(9, Method::Post, PATH_DEF, self.clone()),
-            Route::ranked(9, Method::Head, PATH_DEF, self.clone()),
-        ]
+        let mut ret = Vec::with_capacity(3);
+        if self.settings.allow_get() {
+            ret.push(Route::ranked(9, Method::Get, PATH_DEF, self.clone()));
+            ret.push(Route::ranked(9, Method::Head, PATH_DEF, self.clone()));
+        }
+        if self.settings.allow_post() {
+            ret.push(Route::ranked(9, Method::Post, PATH_DEF, self.clone()));
+        }
+        ret
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rocket::local::asynchronous::Client;
+
+    use super::*;
+
+    async fn generate_client() -> Client {
+        let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let rocket = rocket::build().mount("/", CGIDir::new(format!("{dir}/test")));
+        Client::tracked(rocket).await.unwrap()
+    }
+
+    #[rocket::async_test]
+    async fn simple_script() {
+        let client = generate_client().await;
+        let res = client.get("/simple.sh").dispatch().await;
+        assert_eq!(res.status(), Status::Ok);
+        assert_eq!(res.content_type(), Some(ContentType::Text));
+        assert_eq!(res.into_string().await.unwrap(), "simple output\n");
+    }
+
+    #[rocket::async_test]
+    async fn redirect() {
+        let client = generate_client().await;
+        let res = client.get("/redirect.sh").dispatch().await;
+        assert_eq!(res.status(), Status::SeeOther);
+        assert_eq!(
+            res.headers().get_one("Location").unwrap(),
+            "http://localhost:8000/simple.sh"
+        );
+    }
+
+    #[rocket::async_test]
+    async fn params() {
+        let client = generate_client().await;
+        let res = client.get("/params.sh?world").dispatch().await;
+        assert_eq!(res.status(), Status::Ok);
+        assert_eq!(res.content_type(), Some(ContentType::Text));
+        assert_eq!(res.into_string().await.unwrap(), "Hello 'world'!\n");
+
+        // Unencoded equals
+        let res = client.get("/params.sh?world=hello").dispatch().await;
+        assert_eq!(res.status(), Status::Ok);
+        assert_eq!(res.content_type(), Some(ContentType::Text));
+        assert_eq!(res.into_string().await.unwrap(), "Hello ''!\n");
+
+        // Encoded equals
+        let res = client.get("/params.sh?world%3dhello").dispatch().await;
+        assert_eq!(res.status(), Status::Ok);
+        assert_eq!(res.content_type(), Some(ContentType::Text));
+        assert_eq!(res.into_string().await.unwrap(), "Hello 'world=hello'!\n");
+    }
+
+    #[rocket::async_test]
+    async fn env_vars() {
+        let client = generate_client().await;
+        macro_rules! var {
+            ($var:literal, $val:literal) => {{
+                let res = client.get(concat!("/env_vars.sh?", $var)).dispatch().await;
+                assert_eq!(res.status(), Status::Ok);
+                assert_eq!(res.content_type(), Some(ContentType::Text));
+                assert_eq!(res.into_string().await.unwrap().trim(), $val);
+            }};
+        }
+
+        var!("AUTH_TYPE", "");
+        var!("CONTENT_LENGTH", "");
+        var!("CONTENT_TYPE", "");
+        var!("GATEWAY_INTERFACE", "CGI/1.1");
+        var!("PATH_INFO", "");
+        var!("PATH_TRANSLATED", "");
+        var!("QUERY_STRING", "QUERY_STRING");
+        var!("REMOTE_IDENT", "");
+        var!("REMOTE_USER", "");
+        var!("REQUEST_METHOD", "GET");
+        var!("SCRIPT_NAME", "env_vars.sh");
+        var!("SERVER_NAME", "127.0.0.1");
+        var!("SERVER_PORT", "8000");
+        var!("SERVER_PROTOCOL", "HTTP/1.1");
+        var!("SERVER_SOFTWARE", "Rocket");
+    }
+
+    #[rocket::async_test]
+    async fn post_body() {
+        let client = generate_client().await;
+        let res = client.post("/post.sh").body("something").dispatch().await;
+        assert_eq!(res.status(), Status::Ok);
+        assert_eq!(res.content_type(), Some(ContentType::Text));
+        assert_eq!(res.into_string().await.unwrap(), "val: something\n");
     }
 }
