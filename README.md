@@ -1,5 +1,7 @@
 # Simple CGI (RFC 3875) handler for Rocket
 
+[![https://img.shields.io/crates/v/rocket-cgi.svg]](https://crates.io/crates/rocket-cgi)
+
 Simple standards compliant CGI handler for Rocket. This is still a WIP, and will
 remain so until the security todo items have been handled.
 
